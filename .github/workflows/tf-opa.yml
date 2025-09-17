@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       apply:
-        description: "Run terraform apply (only recommended on main)"
+        description: "Run terraform apply (only on main)"
         required: false
         default: "false"
         type: choice
@@ -24,6 +24,8 @@ concurrency:
 env:
   TF_VERSION: "1.8.5"
   TF_WORKDIR: "./terraform"
+  # Pin Conftest to v0.59.0 to avoid Rego v1 default in >= v0.60
+  CONFTEST_VERSION: "v0.59.0"
 
 jobs:
   plan_and_check:
@@ -47,24 +49,24 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # ---- Robust Conftest install (fix for gzip error) ----
-      - name: Install Conftest (robust)
+      # ---- Install Conftest (pin + robust) ----
+      - name: Install Conftest
         shell: bash
         run: |
           set -euo pipefail
-          OS="$(uname -s)"
+          OS="Linux"
           ARCH="$(uname -m)"
           case "$ARCH" in
             x86_64|amd64) ARCH="x86_64" ;;
             aarch64|arm64) ARCH="arm64" ;;
             *) echo "Unsupported arch: $ARCH"; exit 1 ;;
           esac
-          ASSET="conftest_${OS}_${ARCH}.tar.gz"
-          URL="https://github.com/open-policy-agent/conftest/releases/latest/download/${ASSET}"
+          # Strip leading 'v' for asset filename (e.g., v0.59.0 -> 0.59.0)
+          VER="${CONFTEST_VERSION#v}"
+          ASSET="conftest_${VER}_${OS}_${ARCH}.tar.gz"
+          URL="https://github.com/open-policy-agent/conftest/releases/download/${CONFTEST_VERSION}/${ASSET}"
           echo "Downloading $URL"
           curl -sSLf -o /tmp/conftest.tgz "$URL"
-          file /tmp/conftest.tgz || true
-          ls -lh /tmp/conftest.tgz || true
           tar -xzf /tmp/conftest.tgz -C /tmp
           sudo mv /tmp/conftest /usr/local/bin/conftest
           conftest --version
@@ -103,7 +105,6 @@ jobs:
             ${{ env.TF_WORKDIR }}/plan.json
           retention-days: 7
 
-      # Optional gated apply (only if user triggers workflow_dispatch with apply=true)
       - name: Terraform Apply (gated)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.apply == 'true' && github.ref == 'refs/heads/main' }}
         working-directory: ${{ env.TF_WORKDIR }}
