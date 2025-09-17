@@ -16,7 +16,6 @@ on:
 
 permissions:
   contents: write   # needed for auto-commit of formatting
-  actions: read
 
 concurrency:
   group: tf-opa-${{ github.ref }}
@@ -25,19 +24,15 @@ concurrency:
 env:
   TF_VERSION: "1.8.5"
   TF_WORKDIR: "./terraform"
-  CONFTEST_VERSION: "v0.59.0"   # pin to avoid Rego v1 default in >=0.60
-  TF_BACKEND_BUCKET: "policy-as-code-akuphe"   # <--- change to your bucket
-  TF_BACKEND_TABLE:  "policy-as-code"          # <--- change to your table
+  CONFTEST_VERSION: "v0.59.0"           # pin to avoid Rego v1 default in >=0.60
+  TF_BACKEND_BUCKET: "policy-as-code-akuphe"   # <--- set your bucket
+  TF_BACKEND_TABLE:  "policy-as-code"          # <--- set your lock table
 
 jobs:
-  # 1) Prepare remote backend (S3 bucket + DynamoDB lock table)
+  # 1) Prepare remote backend (S3 + DynamoDB)
   backend_setup:
     name: Backend Setup (S3 + DynamoDB)
     runs-on: ubuntu-latest
-    env:
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      BUCKET: ${{ env.TF_BACKEND_BUCKET }}
-      TABLE:  ${{ env.TF_BACKEND_TABLE }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,20 +48,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          BUCKET="$TF_BACKEND_BUCKET"
+          TABLE="$TF_BACKEND_TABLE"
+          REGION="${AWS_REGION:-${{ secrets.AWS_REGION }}}"
+
           echo "Checking S3 bucket: $BUCKET"
           if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
             echo "Bucket exists."
           else
-            if [ "$AWS_REGION" = "us-east-1" ]; then
+            if [ "$REGION" = "us-east-1" ]; then
               aws s3api create-bucket --bucket "$BUCKET"
             else
               aws s3api create-bucket --bucket "$BUCKET" \
-                --create-bucket-configuration LocationConstraint="$AWS_REGION"
+                --create-bucket-configuration LocationConstraint="$REGION"
             fi
             echo "Created bucket $BUCKET"
           fi
+
           aws s3api put-bucket-versioning \
             --bucket "$BUCKET" --versioning-configuration Status=Enabled
+
           aws s3api put-bucket-encryption \
             --bucket "$BUCKET" \
             --server-side-encryption-configuration \
@@ -84,13 +85,10 @@ jobs:
             echo "Created table $TABLE"
           fi
 
-  # 2) Format job (auto-fix on PR, enforce check everywhere)
+  # 2) Formatting job (auto-fix on PR; always enforce)
   fmt:
     name: Terraform Format
     runs-on: ubuntu-latest
-    env:
-      TF_WORKDIR: ${{ env.TF_WORKDIR }}
-      TF_VERSION: ${{ env.TF_VERSION }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -125,10 +123,6 @@ jobs:
     name: Terraform Plan
     runs-on: ubuntu-latest
     needs: [backend_setup, fmt]
-    env:
-      TF_VERSION: ${{ env.TF_VERSION }}
-      TF_WORKDIR: ${{ env.TF_WORKDIR }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -170,16 +164,11 @@ jobs:
             ${{ env.TF_WORKDIR }}/plan.json
           retention-days: 7
 
-  # 4) Policy check + optional gated apply (downloads artifacts)
+  # 4) Policy check + optional gated apply
   policy_and_apply:
     name: OPA Policy Check (+ optional Apply)
     runs-on: ubuntu-latest
     needs: [plan]
-    env:
-      TF_VERSION: ${{ env.TF_VERSION }}
-      TF_WORKDIR: ${{ env.TF_WORKDIR }}
-      CONFTEST_VERSION: ${{ env.CONFTEST_VERSION }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -225,7 +214,7 @@ jobs:
       - name: OPA Policy Check (Conftest)
         run: conftest test ${{ env.TF_WORKDIR }}/plan.json --policy policies/tfplan
 
-      # Optional gated apply (only on manual run + main branch)
+      # Optional gated apply (manual trigger on main only)
       - name: Terraform Init (for apply)
         if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.apply == 'true' }}
         working-directory: ${{ env.TF_WORKDIR }}
