@@ -14,9 +14,9 @@ on:
         type: choice
         options: ["false", "true"]
 
-# Needed for auto-commit and artifacts
 permissions:
-  contents: write
+  contents: write   # needed for auto-commit of formatting
+  actions: read
 
 concurrency:
   group: tf-opa-${{ github.ref }}
@@ -25,26 +25,22 @@ concurrency:
 env:
   TF_VERSION: "1.8.5"
   TF_WORKDIR: "./terraform"
-  # Pin Conftest before the v0.60+ Rego v1 default
-  CONFTEST_VERSION: "v0.59.0"
-  # >>> Set these to your actual backend names <<<
-  TF_BACKEND_BUCKET: "policy-as-code-akuphe"
-  TF_BACKEND_TABLE:  "policy-as-code"
+  CONFTEST_VERSION: "v0.59.0"   # pin to avoid Rego v1 default in >=0.60
+  TF_BACKEND_BUCKET: "policy-as-code-akuphe"   # <--- change to your bucket
+  TF_BACKEND_TABLE:  "policy-as-code"          # <--- change to your table
 
 jobs:
-  plan_and_check:
-    name: Terraform Plan + OPA Policy Check
+  # 1) Prepare remote backend (S3 bucket + DynamoDB lock table)
+  backend_setup:
+    name: Backend Setup (S3 + DynamoDB)
     runs-on: ubuntu-latest
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
+      BUCKET: ${{ env.TF_BACKEND_BUCKET }}
+      TABLE:  ${{ env.TF_BACKEND_TABLE }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -53,24 +49,19 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # Ensure S3 bucket + DynamoDB table for remote backend exist (idempotent)
       - name: Ensure S3 backend & DynamoDB lock table
         shell: bash
-        env:
-          BUCKET: ${{ env.TF_BACKEND_BUCKET }}
-          TABLE:  ${{ env.TF_BACKEND_TABLE }}
-          REGION: ${{ secrets.AWS_REGION }}
         run: |
           set -euo pipefail
           echo "Checking S3 bucket: $BUCKET"
           if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
             echo "Bucket exists."
           else
-            if [ "$REGION" = "us-east-1" ]; then
+            if [ "$AWS_REGION" = "us-east-1" ]; then
               aws s3api create-bucket --bucket "$BUCKET"
             else
               aws s3api create-bucket --bucket "$BUCKET" \
-                --create-bucket-configuration LocationConstraint="$REGION"
+                --create-bucket-configuration LocationConstraint="$AWS_REGION"
             fi
             echo "Created bucket $BUCKET"
           fi
@@ -93,8 +84,125 @@ jobs:
             echo "Created table $TABLE"
           fi
 
-      # Install Conftest (pinned & robust)
-      - name: Install Conftest
+  # 2) Format job (auto-fix on PR, enforce check everywhere)
+  fmt:
+    name: Terraform Format
+    runs-on: ubuntu-latest
+    env:
+      TF_WORKDIR: ${{ env.TF_WORKDIR }}
+      TF_VERSION: ${{ env.TF_VERSION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Auto-fix formatting for PRs, then commit changes
+      - name: Terraform Format (auto-fix on PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform fmt -recursive
+
+      - name: Commit formatted files (PR only)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: terraform fmt"
+          file_pattern: |
+            **/*.tf
+            **/*.tfvars
+
+      # Enforce formatting in all events (shows diff on failures)
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform fmt -recursive -check -diff
+
+  # 3) Plan job (depends on backend + fmt), uploads plan artifacts
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [backend_setup, fmt]
+    env:
+      TF_VERSION: ${{ env.TF_VERSION }}
+      TF_WORKDIR: ${{ env.TF_WORKDIR }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform init -input=false -upgrade
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform plan -out plan.out
+
+      - name: Export plan.json
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform show -json plan.out > plan.json
+
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-plan-and-policy-artifacts
+          path: |
+            ${{ env.TF_WORKDIR }}/plan.out
+            ${{ env.TF_WORKDIR }}/plan.json
+          retention-days: 7
+
+  # 4) Policy check + optional gated apply (downloads artifacts)
+  policy_and_apply:
+    name: OPA Policy Check (+ optional Apply)
+    runs-on: ubuntu-latest
+    needs: [plan]
+    env:
+      TF_VERSION: ${{ env.TF_VERSION }}
+      TF_WORKDIR: ${{ env.TF_WORKDIR }}
+      CONFTEST_VERSION: ${{ env.CONFTEST_VERSION }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Download plan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: tf-plan-and-policy-artifacts
+          path: ${{ env.TF_WORKDIR }}
+
+      - name: Install Conftest (pinned & robust)
         shell: bash
         run: |
           set -euo pipefail
@@ -114,58 +222,16 @@ jobs:
           sudo mv /tmp/conftest /usr/local/bin/conftest
           conftest --version
 
-      # Auto-fix formatting on PRs, commit back to the branch
-      - name: Auto format Terraform (PR only)
-        if: ${{ github.event_name == 'pull_request' }}
-        working-directory: ${{ env.TF_WORKDIR }}
-        run: terraform fmt -recursive
-
-      - name: Commit formatted files (PR only)
-        if: ${{ github.event_name == 'pull_request' }}
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: terraform fmt"
-          file_pattern: |
-            **/*.tf
-            **/*.tfvars
-
-      # Always enforce formatting (shows diff on failures)
-      - name: Terraform Format Check
-        working-directory: ${{ env.TF_WORKDIR }}
-        run: terraform fmt -recursive -check -diff
-
-      - name: Terraform Init
-        working-directory: ${{ env.TF_WORKDIR }}
-        run: terraform init -input=false -upgrade
-
-      - name: Terraform Validate
-        working-directory: ${{ env.TF_WORKDIR }}
-        run: terraform validate
-
-      - name: Terraform Plan
-        id: plan
-        working-directory: ${{ env.TF_WORKDIR }}
-        run: terraform plan -out plan.out
-
-      - name: Export plan.json
-        working-directory: ${{ env.TF_WORKDIR }}
-        run: terraform show -json plan.out > plan.json
-
       - name: OPA Policy Check (Conftest)
         run: conftest test ${{ env.TF_WORKDIR }}/plan.json --policy policies/tfplan
 
-      - name: Upload plan + artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tf-plan-and-policy-artifacts
-          path: |
-            ${{ env.TF_WORKDIR }}/plan.out
-            ${{ env.TF_WORKDIR }}/plan.json
-          retention-days: 7
+      # Optional gated apply (only on manual run + main branch)
+      - name: Terraform Init (for apply)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.apply == 'true' }}
+        working-directory: ${{ env.TF_WORKDIR }}
+        run: terraform init -input=false
 
-      # Optional gated apply (only on manual run + main)
       - name: Terraform Apply (gated)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.apply == 'true' && github.ref == 'refs/heads/main' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.apply == 'true' }}
         working-directory: ${{ env.TF_WORKDIR }}
         run: terraform apply -auto-approve plan.out
