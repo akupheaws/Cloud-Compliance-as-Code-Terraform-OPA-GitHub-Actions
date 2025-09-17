@@ -1,9 +1,9 @@
 terraform {
   backend "s3" {
-    bucket         = "your-tfstate-bucket"
+    bucket         = "my-unique-terraform-backend"
     key            = "cloud-compliance-as-code/terraform.tfstate"
     region         = "us-east-1"
-    dynamodb_table = "your-tflock-table"
+    use_lockfile = true
     encrypt        = true
   }
 }
