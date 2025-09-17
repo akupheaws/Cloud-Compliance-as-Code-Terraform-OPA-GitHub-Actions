@@ -1,0 +1,52 @@
+name: Terraform + OPA Compliance
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  compliance:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+
+      - name: Install Conftest
+        run: |
+          curl -L https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz \
+            | tar -xz
+          sudo mv conftest /usr/local/bin/conftest
+          conftest --version
+
+      - name: Configure AWS creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init -input=false -upgrade
+
+      - name: Terraform Plan
+        working-directory: ./terraform
+        run: terraform plan -out plan.out
+
+      - name: Export Plan JSON
+        working-directory: ./terraform
+        run: terraform show -json plan.out > plan.json
+
+      - name: OPA Policy Check
+        run: conftest test ./terraform/plan.json --policy policies/tfplan
